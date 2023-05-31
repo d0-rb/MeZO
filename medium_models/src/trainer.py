@@ -239,10 +239,10 @@ class Trainer(LinearHeadTrainer):
         self.state.zo_forward_step += 1
         return loss.detach()
 
-    def efficient_perturb_parameters(self, model: nn.Module, random_seed: int, scaling_factor=1):
+    def efficient_perturb_parameters(self, model: nn.Module, random_seed: int, z_idx: int, num_zs: int, scaling_factor=1):
         torch.manual_seed(random_seed)
         for name, param in self.named_parameters_to_optim:
-            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            z = torch.normal(mean=0, std=1, size=(*param.data.size(), num_zs), device=param.data.device, dtype=param.data.dtype)[..., z_idx]
             param.data = param.data + scaling_factor * z * self.args.zero_order_eps
         return model
 
@@ -589,10 +589,12 @@ class Trainer(LinearHeadTrainer):
                     else:
                         # get number of zs to sample
                         num_zs = self.get_num_samples()
+                        projected_grad = torch.empty(num_zs, device=self.args.device)
                         if num_zs > 1:
-                            assert self.args.zero_order_use_trainer_optim, 'cannot sample multiple zs without storing intermediate gradient. use trainer.'
+                            # assert self.args.zero_order_use_trainer_optim, 'cannot sample multiple zs without storing intermediate gradient. use trainer.'
+                            pass
 
-                        for _ in range(num_zs):
+                        for z_idx in range(num_zs):
                             # prepare for sampling new zs
                             random_vector = None
                             if self.args.efficient_zero_order:
@@ -601,7 +603,7 @@ class Trainer(LinearHeadTrainer):
                             with torch.no_grad():
                                 # first function evaluation
                                 if self.args.efficient_zero_order:
-                                    model = self.efficient_perturb_parameters(model, random_seed)
+                                    model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model)
                                 else:
@@ -610,23 +612,23 @@ class Trainer(LinearHeadTrainer):
 
                                 # second function evaluation
                                 if self.args.efficient_zero_order:
-                                    model = self.efficient_perturb_parameters(model, random_seed, scaling_factor=-2)
+                                    model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs, scaling_factor=-2)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model, random_vector, scaling_factor=-2)
                                 else:
                                     model, random_vector = self.perturb_parameters(model, random_vector, scaling_factor=-2)                 
                                 loss2 = self.zo_forward(model, inputs)
 
-                            projected_grad = (loss1 - loss2) / (2 * self.args.zero_order_eps)
+                            projected_grad[z_idx] = (loss1 - loss2) / (2 * self.args.zero_order_eps)
 
                             # scale grad according to accumulation
                             if self.args.gradient_accumulation_steps > 1:
                                 assert self.args.zero_order_use_trainer_optim, 'grad accumulation not implemented for non-trainer ZO yet'
-                                projected_grad = projected_grad / self.args.gradient_accumulation_steps
+                                projected_grad[z_idx] = projected_grad[z_idx] / self.args.gradient_accumulation_steps
                             
                             # scale grad according to number of zs sampled
                             if not self.args.scale_lr_with_samples:
-                                projected_grad = projected_grad / float(num_zs)
+                                projected_grad[z_idx] = projected_grad[z_idx] / float(num_zs)
 
                             # store gradient in parameter buffer if using trainer
                             # o/w, the loop will exit after one round and the update will be applied directly (see below)
@@ -648,13 +650,13 @@ class Trainer(LinearHeadTrainer):
                                             z = z * self.cs[cname]
 
                                     if param.grad is None:
-                                        param.grad = projected_grad * z
+                                        param.grad = projected_grad[z_idx] * z
                                     else:
-                                        param.grad += projected_grad * z
+                                        param.grad += projected_grad[z_idx] * z
 
                             # reset model back to its parameters at start of step
                             if self.args.efficient_zero_order:
-                                model = self.efficient_perturb_parameters(model, random_seed)
+                                model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs)
                             elif self.args.zo_variant is not None:
                                 model, random_vector = self.norm_perturb_parameters(model, random_vector)   
                             else:
@@ -711,17 +713,20 @@ class Trainer(LinearHeadTrainer):
                         # Efficient mode 
                         # WARNING: no gradient accumulation when not storing the grad
                         assert self.args.gradient_accumulation_steps == 1, 'gradient accumulation is not supported for zero-order optimization'
-                        assert self.args.zero_order_sample_scheduler is None
+                        # assert self.args.zero_order_sample_scheduler is None
                         assert not self.args.zero_order_clip_grad, 'gradient clipping not implemented yet for non-trainer ZO'
 
                         if self.args.efficient_zero_order:
                             torch.manual_seed(random_seed)     
                         for name, param in self.named_parameters_to_optim:
                             if self.args.efficient_zero_order:
-                                z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                                z = torch.normal(mean=0, std=1, size=(*param.data.size(), num_zs), device=param.data.device, dtype=param.data.dtype)
+
+                                param.data = param.data - self.args.learning_rate * torch.sum(projected_grad * z, dim=-1)
                             else:
                                 z = random_vector[name]
-                            param.data = param.data - self.args.learning_rate * projected_grad * z 
+
+                                param.data = param.data - self.args.learning_rate * projected_grad * z 
 
                         if (self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0) or (
                                 self.state.global_step == 1 and self.args.logging_first_step
