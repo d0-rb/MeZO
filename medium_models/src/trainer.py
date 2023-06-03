@@ -245,6 +245,46 @@ class Trainer(LinearHeadTrainer):
             z = torch.normal(mean=0, std=1, size=(*param.data.size(), num_zs), device=param.data.device, dtype=param.data.dtype)[..., z_idx]
             param.data = param.data + scaling_factor * z * self.args.zero_order_eps
         return model
+    
+    def efficient_perturb_parameters_orthonormalize(self, model: nn.Module, random_seed: int, z_idx: int, num_zs: int, norms: torch.Tensor, projections: torch.Tensor, scaling_factor=1):
+        torch.manual_seed(random_seed)
+        for name, param in self.named_parameters_to_optim:
+            z = torch.normal(mean=0, std=1, size=(*param.data.size(), num_zs), device=param.data.device, dtype=param.data.dtype)
+            z = z @ projections  # orthogonalize
+            z = z / norms  # normalize
+            
+            param.data = param.data + scaling_factor * z[..., z_idx] * self.args.zero_order_eps
+
+        return model
+    
+    def get_norms_and_projections(self, random_seed: int, num_zs: int):
+        torch.manual_seed(random_seed)
+        projections = torch.empty((num_zs, num_zs), device=self.args.device, dtype=torch.float32)
+
+        # first run thru to get dot products of each vector with each other
+        for name, param in self.named_parameters_to_optim:
+            z = torch.normal(mean=0, std=1, size=(torch.numel(param.data), num_zs), device=param.data.device, dtype=param.data.dtype)
+
+            projections += z.T @ z
+        
+        norms = projections.diag()  # actually norms squared
+        projections /= norms.unsqueeze(1)  # dim 0 is the vector being projected onto, dim 1 is the vector being projected
+        projections = -projections.triu()
+        projections.fill_diagonal_(1)  # now we can gram-schmidt by simply matrix multiplying
+        
+        norms = torch.zeros(num_zs, device=self.args.device, dtype=torch.float32)
+        
+        # second run thru to get the norms of each vector after orthogonalization
+        torch.manual_seed(random_seed)
+        for name, param in self.named_parameters_to_optim:
+            z = torch.normal(mean=0, std=1, size=(torch.numel(param.data), num_zs), device=param.data.device, dtype=param.data.dtype)
+            z = z @ projections  # orthogonalize
+            
+            norms += torch.sum(z ** 2, dim=0)
+        
+        norms = torch.sqrt(norms)
+        
+        return projections, norms
 
     def norm_perturb_parameters(self, model: nn.Module, random_vector=None, scaling_factor=1):
         if random_vector is None:
@@ -590,9 +630,10 @@ class Trainer(LinearHeadTrainer):
                         # get number of zs to sample
                         num_zs = self.get_num_samples()
                         projected_grad = torch.empty(num_zs, device=self.args.device)
-                        if num_zs > 1:
-                            # assert self.args.zero_order_use_trainer_optim, 'cannot sample multiple zs without storing intermediate gradient. use trainer.'
-                            pass
+                        
+                        if self.args.orthonormalize:
+                            z_norms, z_projections = self.get_norms_and_projections(random_seed, num_zs)
+
 
                         for z_idx in range(num_zs):
                             # prepare for sampling new zs
@@ -601,8 +642,11 @@ class Trainer(LinearHeadTrainer):
                                 random_seed = np.random.randint(1000000000)
 
                             with torch.no_grad():
+
                                 # first function evaluation
-                                if self.args.efficient_zero_order:
+                                if self.args.efficient_zero_order and self.args.orthonormalize:
+                                    model = self.efficient_perturb_parameters_orthonormalize(model, random_seed, z_idx, num_zs, z_norms, z_projections)
+                                elif self.args.efficient_zero_order:
                                     model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model)
@@ -611,7 +655,9 @@ class Trainer(LinearHeadTrainer):
                                 loss1 = self.zo_forward(model, inputs)
 
                                 # second function evaluation
-                                if self.args.efficient_zero_order:
+                                if self.args.efficient_zero_order and self.args.orthonormalize:
+                                    model = self.efficient_perturb_parameters_orthonormalize(model, random_seed, z_idx, num_zs, z_norms, z_projections, scaling_factor=-2)
+                                elif self.args.efficient_zero_order:
                                     model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs, scaling_factor=-2)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model, random_vector, scaling_factor=-2)
@@ -655,7 +701,9 @@ class Trainer(LinearHeadTrainer):
                                         param.grad += projected_grad[z_idx] * z
 
                             # reset model back to its parameters at start of step
-                            if self.args.efficient_zero_order:
+                            if self.args.efficient_zero_order and self.args.orthonormalize:
+                                model = self.efficient_perturb_parameters_orthonormalize(model, random_seed, z_idx, num_zs, z_norms, z_projections)
+                            elif self.args.efficient_zero_order:
                                 model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs)
                             elif self.args.zo_variant is not None:
                                 model, random_vector = self.norm_perturb_parameters(model, random_vector)   
