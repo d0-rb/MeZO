@@ -419,6 +419,10 @@ class DynamicTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Efficient zero-order: resample noise vectors instead of saving them. enable different model loading using --hf_inference_model"}
     )
+    orthonormalize: bool = field(
+        default=False,
+        metadata={"help": "When using multiple zero-order samples, use Gram-Schmidt to orthonormalize the samples"}
+    )
     hf_inference_model: bool = field(
         default=False,
         metadata={"help": "loads the HF model in inference mode across many GPUs. incompatible with --zero_order_use_trainer_optim."}
