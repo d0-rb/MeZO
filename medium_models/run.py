@@ -423,6 +423,18 @@ class DynamicTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "When using multiple zero-order samples, use Gram-Schmidt to orthonormalize the samples"}
     )
+    momentum_beta: float = field(
+        default=0.0,
+        metadata={"help": "Momentum beta value for memory-efficient zero order optimization"}
+    )
+    momentum_steps: int = field(
+        default=1,
+        metadata={"help": "Number of steps to approximate momentum with for memory-efficient zero order optimization"}
+    )
+    use_nesterov_momentum: bool = field(
+        default=False,
+        metadata={"help": "Whether to use Nesterov momentum for memory-efficient zero order optimization"}
+    )
     hf_inference_model: bool = field(
         default=False,
         metadata={"help": "loads the HF model in inference mode across many GPUs. incompatible with --zero_order_use_trainer_optim."}

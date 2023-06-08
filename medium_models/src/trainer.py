@@ -257,7 +257,7 @@ class Trainer(LinearHeadTrainer):
 
         return model
     
-    def get_norms_and_projections(self, random_seed: int, num_zs: int):
+    def get_norms_and_projections(self, random_seed: int, num_zs: int, prev_norms: torch.nested.nested_tensor, prev_projections: torch.nested.nested_tensor):
         torch.manual_seed(random_seed)
         projections = torch.empty((num_zs, num_zs), device=self.args.device, dtype=torch.float32)
 
@@ -283,8 +283,14 @@ class Trainer(LinearHeadTrainer):
             norms += torch.sum(z ** 2, dim=0)
         
         norms = torch.sqrt(norms)
+
+        prev_norms[1:] = prev_norms[:-1]
+        prev_norms[0] = norms
+
+        prev_projections[1:] = prev_projections[:-1]
+        prev_projections[0] = projections
         
-        return projections, norms
+        return prev_norms, prev_projections
 
     def norm_perturb_parameters(self, model: nn.Module, random_vector=None, scaling_factor=1):
         if random_vector is None:
@@ -436,6 +442,16 @@ class Trainer(LinearHeadTrainer):
         # print("Sample %d zs" % (noise_sample_time))
 
         return noise_sample_time
+    
+    def get_momentum_weights(self, momentum_steps: int):
+        if momentum_steps <= 1:
+            return 1.0
+
+        momentum_weights = torch.empty(momentum_steps, device=self.args.device)
+        momentum_weights[1:] = self.get_momentum_weights(momentum_steps - 1) * self.args.momentum_beta
+        momentum_weights[0] = 1 - self.args.momentum_beta
+
+        return momentum_weights
 
     def train(self, model_path=None, dev_objective=None):
         """
@@ -551,6 +567,22 @@ class Trainer(LinearHeadTrainer):
         logging_loss_scalar = 0.0
         model.zero_grad()
         metrics = None
+
+        momentum_weights = self.get_momentum_weights(self.args.momentum_steps).unsqueeze(1)
+        past_seeds = torch.empty((self.args.momentum_steps), device=self.args.device, dtype=torch.int64)
+        past_num_zs = torch.empty((self.args.momentum_steps), device=self.args.device, dtype=torch.int64)
+        projected_grads = torch.nested.nested_tensor([torch.zeros(1, device=self.args.device) for _ in range(self.args.momentum_steps)], device=self.args.device)
+        global_seed = np.random.randint(0, 2**32 - 1)
+        if self.args.orthonormalize:
+            z_norms = torch.nested.nested_tensor([torch.ones((1,), device=self.args.device, dtype=torch.float32) for _ in range(self.args.momentum_steps)], device=self.args.device)
+            z_projections = torch.nested.nested_tensor([torch.zeros(((1, 1)), device=self.args.device, dtype=torch.float32) for _ in range(self.args.momentum_steps)], device=self.args.device)
+
+        if self.args.efficient_zero_order:
+            num_epochs = int(num_train_epochs) - epochs_trained
+            step_seeds = torch.randint(0, 2**32 - 1, (num_epochs, len(train_dataloader)), device=self.args.device)
+        
+        torch.manual_seed(global_seed)
+        print(f'Global seed: {global_seed}')
         for epoch in range(epochs_trained, int(num_train_epochs)):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
@@ -568,6 +600,12 @@ class Trainer(LinearHeadTrainer):
                 self._past = None
 
             for step, inputs in enumerate(epoch_iterator):
+                step_seed = step_seeds[epoch, step].item()
+
+                torch.manual_seed(step_seed)
+                past_seeds[1:] = past_seeds[:-1]
+                past_seeds[0] = step_seed
+
                 if self.args.sync_embedding_layers:
                     assert model.module.model_type == 'opt', 'did not implement embedding layer synchronization for non-OPT models'
                     model.module.model.decoder.embed_tokens.weight = model.module.lm_head.weight
@@ -629,25 +667,26 @@ class Trainer(LinearHeadTrainer):
                     else:
                         # get number of zs to sample
                         num_zs = self.get_num_samples()
-                        projected_grad = torch.empty(num_zs, device=self.args.device)
+                        past_num_zs[1:] = past_num_zs[:-1]
+                        past_num_zs[0] = num_zs
+
+                        projected_grads[1:] = projected_grads[:-1]
+                        projected_grads[0] = torch.empty(num_zs, device=self.args.device)
                         
                         if self.args.orthonormalize:
-                            z_norms, z_projections = self.get_norms_and_projections(random_seed, num_zs)
-
+                            z_norms, z_projections = self.get_norms_and_projections(step_seed, num_zs, z_norms, z_projections)
 
                         for z_idx in range(num_zs):
                             # prepare for sampling new zs
                             random_vector = None
-                            if self.args.efficient_zero_order:
-                                random_seed = np.random.randint(1000000000)
 
                             with torch.no_grad():
 
                                 # first function evaluation
                                 if self.args.efficient_zero_order and self.args.orthonormalize:
-                                    model = self.efficient_perturb_parameters_orthonormalize(model, random_seed, z_idx, num_zs, z_norms, z_projections)
+                                    model = self.efficient_perturb_parameters_orthonormalize(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0])
                                 elif self.args.efficient_zero_order:
-                                    model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs)
+                                    model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model)
                                 else:
@@ -656,32 +695,32 @@ class Trainer(LinearHeadTrainer):
 
                                 # second function evaluation
                                 if self.args.efficient_zero_order and self.args.orthonormalize:
-                                    model = self.efficient_perturb_parameters_orthonormalize(model, random_seed, z_idx, num_zs, z_norms, z_projections, scaling_factor=-2)
+                                    model = self.efficient_perturb_parameters_orthonormalize(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0], scaling_factor=-2)
                                 elif self.args.efficient_zero_order:
-                                    model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs, scaling_factor=-2)
+                                    model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs, scaling_factor=-2)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model, random_vector, scaling_factor=-2)
                                 else:
                                     model, random_vector = self.perturb_parameters(model, random_vector, scaling_factor=-2)                 
                                 loss2 = self.zo_forward(model, inputs)
 
-                            projected_grad[z_idx] = (loss1 - loss2) / (2 * self.args.zero_order_eps)
+                            projected_grads[0, z_idx] = (loss1 - loss2) / (2 * self.args.zero_order_eps)
 
                             # scale grad according to accumulation
                             if self.args.gradient_accumulation_steps > 1:
                                 assert self.args.zero_order_use_trainer_optim, 'grad accumulation not implemented for non-trainer ZO yet'
-                                projected_grad[z_idx] = projected_grad[z_idx] / self.args.gradient_accumulation_steps
+                                projected_grads[0, z_idx] = projected_grads[0, z_idx] / self.args.gradient_accumulation_steps
                             
                             # scale grad according to number of zs sampled
                             if not self.args.scale_lr_with_samples:
-                                projected_grad[z_idx] = projected_grad[z_idx] / float(num_zs)
+                                projected_grads[0, z_idx] = projected_grads[0, z_idx] / float(num_zs)
 
                             # store gradient in parameter buffer if using trainer
                             # o/w, the loop will exit after one round and the update will be applied directly (see below)
                             if self.args.zero_order_use_trainer_optim:
                                 if self.args.efficient_zero_order:
                                     # print(random_seed)
-                                    torch.manual_seed(random_seed)
+                                    torch.manual_seed(step_seed)
                                 
                                 for name, param in self.named_parameters_to_optim:
                                     # recover noise used in perturbations
@@ -696,15 +735,15 @@ class Trainer(LinearHeadTrainer):
                                             z = z * self.cs[cname]
 
                                     if param.grad is None:
-                                        param.grad = projected_grad[z_idx] * z
+                                        param.grad = projected_grads[0, z_idx] * z
                                     else:
-                                        param.grad += projected_grad[z_idx] * z
+                                        param.grad += projected_grads[0, z_idx] * z
 
                             # reset model back to its parameters at start of step
                             if self.args.efficient_zero_order and self.args.orthonormalize:
-                                model = self.efficient_perturb_parameters_orthonormalize(model, random_seed, z_idx, num_zs, z_norms, z_projections)
+                                model = self.efficient_perturb_parameters_orthonormalize(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0])
                             elif self.args.efficient_zero_order:
-                                model = self.efficient_perturb_parameters(model, random_seed, z_idx, num_zs)
+                                model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs)
                             elif self.args.zo_variant is not None:
                                 model, random_vector = self.norm_perturb_parameters(model, random_vector)   
                             else:
@@ -765,19 +804,24 @@ class Trainer(LinearHeadTrainer):
                         assert not self.args.zero_order_clip_grad, 'gradient clipping not implemented yet for non-trainer ZO'
 
                         if self.args.efficient_zero_order:
-                            torch.manual_seed(random_seed)
-                        for name, param in self.named_parameters_to_optim:
-                            if self.args.efficient_zero_order:
-                                z = torch.normal(mean=0, std=1, size=(*param.data.size(), num_zs), device=param.data.device, dtype=param.data.dtype)
-                                if self.args.orthonormalize:
-                                    z = z @ z_projections  # orthogonalize
-                                    z = z / z_norms  # normalize
+                            for momentum_replay_idx in range(self.args.momentum_steps):
+                                momentum_replay_seed = past_seeds[momentum_replay_idx]
+                                momentum_replay_num_zs = past_num_zs[momentum_replay_idx]
+                                torch.manual_seed(momentum_replay_seed)
 
-                                param.data = param.data - self.args.learning_rate * torch.sum(projected_grad * z, dim=-1)
-                            else:
+                                for name, param in self.named_parameters_to_optim:
+                                    z = torch.normal(mean=0, std=1, size=(*param.data.size(), momentum_replay_num_zs), device=param.data.device, dtype=param.data.dtype)
+
+                                    if self.args.orthonormalize:
+                                        z = z @ z_projections  # orthogonalize
+                                        z = z / z_norms  # normalize
+
+                                    param.data = param.data - self.args.learning_rate * torch.sum(projected_grads[momentum_replay_idx] * z, dim=-1) * momentum_weights
+                        else:
+                            for name, param in self.named_parameters_to_optim:
                                 z = random_vector[name]
 
-                                param.data = param.data - self.args.learning_rate * projected_grad * z 
+                                param.data = param.data - self.args.learning_rate * projected_grads[0] * z 
 
                         if (self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0) or (
                                 self.state.global_step == 1 and self.args.logging_first_step
