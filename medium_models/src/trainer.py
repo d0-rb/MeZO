@@ -238,20 +238,16 @@ class Trainer(LinearHeadTrainer):
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
         self.state.zo_forward_step += 1
         return loss.detach()
-
-    def efficient_perturb_parameters(self, model: nn.Module, random_seed: int, z_idx: int, num_zs: int, scaling_factor=1):
-        torch.manual_seed(random_seed)
-        for name, param in self.named_parameters_to_optim:
-            z = torch.normal(mean=0, std=1, size=(*param.data.size(), num_zs), device=param.data.device, dtype=param.data.dtype)[..., z_idx]
-            param.data = param.data + scaling_factor * z * self.args.zero_order_eps
-        return model
     
-    def efficient_perturb_parameters_orthonormalize(self, model: nn.Module, random_seed: int, z_idx: int, num_zs: int, norms: torch.Tensor, projections: torch.Tensor, scaling_factor=1):
+    def efficient_perturb_parameters(self, model: nn.Module, random_seed: int, z_idx: int, num_zs: int, norms: torch.Tensor, projections: torch.Tensor, orthogonalize: bool = False, normalize: bool = False, normalization_scale: float = 1.0, scaling_factor: int | float = 1):
         torch.manual_seed(random_seed)
         for name, param in self.named_parameters_to_optim:
             z = torch.normal(mean=0, std=1, size=(*param.data.size(), num_zs), device=param.data.device, dtype=param.data.dtype)
-            z = z @ projections  # orthogonalize
-            z = z / norms  # normalize
+
+            if orthogonalize:
+                z = z @ projections  # orthogonalize
+            if normalize:
+                z = z / (norms / normalization_scale)  # normalize and multiply by normalization scale
             
             param.data = param.data + scaling_factor * z[..., z_idx] * self.args.zero_order_eps
 
@@ -452,6 +448,16 @@ class Trainer(LinearHeadTrainer):
         momentum_weights[0] = 1 - self.args.momentum_beta
 
         return momentum_weights
+    
+    def get_normalization_scale(self, model: torch.nn.Module):
+        if not self.args.normalization_scaling:
+            return 1.0
+        
+        normalization_scale = 0.0
+        for name, param in self.named_parameters_to_optim:
+            normalization_scale += param.data.numel()
+        
+        return normalization_scale.sqrt()
 
     def train(self, model_path=None, dev_objective=None):
         """
@@ -573,7 +579,8 @@ class Trainer(LinearHeadTrainer):
         past_num_zs = torch.empty((self.args.momentum_steps), device=self.args.device, dtype=torch.int64)
         projected_grads = torch.nested.nested_tensor([torch.zeros(1, device=self.args.device) for _ in range(self.args.momentum_steps)], device=self.args.device)
         global_seed = np.random.randint(0, 2**32 - 1)
-        if self.args.orthonormalize:
+        normalization_scale = self.get_normalization_scale(model)
+        if self.args.orthogonalize or self.args.normalize:
             z_norms = torch.nested.nested_tensor([torch.ones((1,), device=self.args.device, dtype=torch.float32) for _ in range(self.args.momentum_steps)], device=self.args.device)
             z_projections = torch.nested.nested_tensor([torch.zeros(((1, 1)), device=self.args.device, dtype=torch.float32) for _ in range(self.args.momentum_steps)], device=self.args.device)
 
@@ -673,7 +680,7 @@ class Trainer(LinearHeadTrainer):
                         projected_grads[1:] = projected_grads[:-1]
                         projected_grads[0] = torch.empty(num_zs, device=self.args.device)
                         
-                        if self.args.orthonormalize:
+                        if self.args.orthogonalize or self.args.normalize:
                             z_norms, z_projections = self.get_norms_and_projections(step_seed, num_zs, z_norms, z_projections)
 
                         for z_idx in range(num_zs):
@@ -683,10 +690,8 @@ class Trainer(LinearHeadTrainer):
                             with torch.no_grad():
 
                                 # first function evaluation
-                                if self.args.efficient_zero_order and self.args.orthonormalize:
-                                    model = self.efficient_perturb_parameters_orthonormalize(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0])
-                                elif self.args.efficient_zero_order:
-                                    model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs)
+                                if self.args.efficient_zero_order:
+                                    model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0], self.args.orthogonalize, self.args.normalize, normalization_scale)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model)
                                 else:
@@ -694,10 +699,8 @@ class Trainer(LinearHeadTrainer):
                                 loss1 = self.zo_forward(model, inputs)
 
                                 # second function evaluation
-                                if self.args.efficient_zero_order and self.args.orthonormalize:
-                                    model = self.efficient_perturb_parameters_orthonormalize(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0], scaling_factor=-2)
-                                elif self.args.efficient_zero_order:
-                                    model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs, scaling_factor=-2)
+                                if self.args.efficient_zero_order:
+                                    model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0], self.args.orthogonalize, self.args.normalize, normalization_scale, scaling_factor=-2)
                                 elif self.args.zo_variant is not None:
                                     model, random_vector = self.norm_perturb_parameters(model, random_vector, scaling_factor=-2)
                                 else:
@@ -740,10 +743,8 @@ class Trainer(LinearHeadTrainer):
                                         param.grad += projected_grads[0, z_idx] * z
 
                             # reset model back to its parameters at start of step
-                            if self.args.efficient_zero_order and self.args.orthonormalize:
-                                model = self.efficient_perturb_parameters_orthonormalize(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0])
-                            elif self.args.efficient_zero_order:
-                                model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs)
+                            if self.args.efficient_zero_order:
+                                model = self.efficient_perturb_parameters(model, step_seed, z_idx, num_zs, z_norms[0], z_projections[0], self.args.orthogonalize, self.args.normalize, normalization_scale)
                             elif self.args.zo_variant is not None:
                                 model, random_vector = self.norm_perturb_parameters(model, random_vector)   
                             else:
@@ -812,9 +813,10 @@ class Trainer(LinearHeadTrainer):
                                 for name, param in self.named_parameters_to_optim:
                                     z = torch.normal(mean=0, std=1, size=(*param.data.size(), momentum_replay_num_zs), device=param.data.device, dtype=param.data.dtype)
 
-                                    if self.args.orthonormalize:
+                                    if self.args.orthogonalize:
                                         z = z @ z_projections  # orthogonalize
-                                        z = z / z_norms  # normalize
+                                    if self.args.normalize:
+                                        z = z / (z_norms / normalization_scale)  # normalize and multiply by normalization scale
 
                                     param.data = param.data - self.args.learning_rate * torch.sum(projected_grads[momentum_replay_idx] * z, dim=-1) * momentum_weights
                         else:

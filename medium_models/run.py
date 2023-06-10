@@ -419,9 +419,17 @@ class DynamicTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Efficient zero-order: resample noise vectors instead of saving them. enable different model loading using --hf_inference_model"}
     )
-    orthonormalize: bool = field(
+    orthogonalize: bool = field(
         default=False,
-        metadata={"help": "When using multiple zero-order samples, use Gram-Schmidt to orthonormalize the samples"}
+        metadata={"help": "When using multiple zero-order samples, orthogonalize the samples. With normalize, this is equivalent to Gram-Schmidt"}
+    )
+    normalize: bool = field(
+        default=False,
+        metadata={"help": "Normalize the zero-order samples. With orthogonalize, this is equivalent to Gram-Schmidt"}
+    )
+    normalization_scaling: bool = field(
+        default=True,
+        metadata={"help": "When normalizing samples, whether to scale the samples by sqrt(n) for n model parameters"}
     )
     momentum_beta: float = field(
         default=0.0,
