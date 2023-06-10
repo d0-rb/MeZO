@@ -439,10 +439,6 @@ class DynamicTrainingArguments(TrainingArguments):
         default=1,
         metadata={"help": "Number of steps to approximate momentum with for memory-efficient zero order optimization"}
     )
-    use_nesterov_momentum: bool = field(
-        default=False,
-        metadata={"help": "Whether to use Nesterov momentum for memory-efficient zero order optimization"}
-    )
     hf_inference_model: bool = field(
         default=False,
         metadata={"help": "loads the HF model in inference mode across many GPUs. incompatible with --zero_order_use_trainer_optim."}
